@@ -1,48 +1,67 @@
-require('dotenv').config();
-const express = require('express');
-const chalk = require('chalk');
-const compression = require('compression');
-const cors = require('cors');
-const path = require('path');
-const helmet = require('helmet');
+const socketio = require('socket.io');
+const jwt = require('jsonwebtoken');
+const mongoose = require('mongoose');
 
-const keys = require('./config/keys');
-const routes = require('./routes');
-const socket = require('./socket');
-const setupDB = require('./utils/db');
+const { ROLES } = require('../constants');
+const keys = require('../config/keys');
+const User = mongoose.model('User');
 
-const { port } = keys;
-const app = express();
+const support = require('./support');
 
-app.use(express.urlencoded({ extended: true }));
-app.use(express.json());
-app.use(
-  helmet({
-    contentSecurityPolicy: false,
-    frameguard: true
-  })
-);
-app.use(cors());
-app.use(express.static(path.resolve(__dirname, '../dist')));
+const authHandler = async (socket, next) => {
+  const { token = null } = socket.handshake.auth;
+  if (token) {
+    const [authType, tokenValue] = token.trim().split(' ');
+    if (authType !== 'Bearer' || !tokenValue) {
+      return next(new Error('no token'));
+    }
 
-setupDB();
-require('./config/passport')(app);
-app.use(routes);
+    const { secret } = keys.jwt;
+    const payload = jwt.verify(tokenValue, secret);
+    const id = payload.id.toString();
+    const user = await User.findById(id);
 
-console.log('process.env.NODE_ENV ', process.env.NODE_ENV);
-if (process.env.NODE_ENV === 'production') {
-  app.use(compression());
-  app.get('*', (req, res) => {
-    res.sendFile(path.resolve(__dirname, '../dist/index.html'));
+    if (!user) {
+      return next(new Error('no user found'));
+    }
+
+    const u = {
+      id,
+      role: user?.role,
+      isAdmin: user.role === ROLES.Admin,
+      name: `${user?.firstName} ${user?.lastName}`,
+      socketId: socket.id,
+      messages: []
+    };
+
+    const existingUser = support.findUserById(id);
+    if (!existingUser) {
+      support.users.push(u);
+    } else {
+      existingUser.socketId = socket.id;
+    }
+  } else {
+    return next(new Error('no token'));
+  }
+
+  next();
+};
+
+const socket = server => {
+  const io = socketio(server, {
+    cors: {
+      origin: '*',
+      methods: ['GET', 'POST']
+    }
   });
-}
 
-const server = app.listen(port, () => {
-  console.log(
-    `${chalk.green('✓')} ${chalk.blue(
-      `Listening on port ${port}. Visit http://localhost:${port}/ in your browser.`
-    )}`
-  );
-});
+  io.use(authHandler);
 
-socket(server);
+  const onConnection = socket => {
+    support.supportHandler(io, socket);
+  };
+
+  io.on('connection', onConnection);
+};
+
+module.exports = socket;
